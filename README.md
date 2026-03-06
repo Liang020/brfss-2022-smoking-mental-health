@@ -24,6 +24,16 @@ This was a group project. I led the **multivariable modeling and the subsequent 
 - After multivariable adjustment using a weighted log-linear model with HC3 robust standard errors, the smoking-status term remained significant overall (Type III p ≈ 0.0017). At the coefficient level, only former vs. never was significant (β = −0.384, p ≈ 0.0010), corresponding to about 32% fewer mentally unhealthy days on the original scale.
 - Diagnostics improved after log transformation, but heteroskedasticity persisted (motivating robust SE). VIF suggested no serious multicollinearity. The final model had weighted R² ≈ 0.166 (Adj-R² ≈ 0.160).
 
+## Visual highlights
+**Choosing a transformation (Box–Cox)**
+![Box-Cox](figures/boxcox.png)
+
+**Influence diagnostics (leverage & Cook’s distance)**
+![Leverage](figures/leverage_cooks.png)
+
+**Multicollinearity check (VIF)** *(optional)*
+![VIF](figures/vif.png)
+
 ## Report
 - Live HTML report (GitHub Pages): (to be added)
 
