@@ -35,7 +35,7 @@ This was a group project. I led the **multivariable modeling and the subsequent 
 ![VIF](figures/vif.png)
 
 ## Report
-- Live HTML report (GitHub Pages): (to be added)
+- Live HTML report (GitHub Pages): https://liang020.github.io/brfss-2022-smoking-mental-health/
 
 ## Reproducibility (summary)
 Open `Report.rmd` and knit the report after placing the BRFSS 2022 data under `data/` (see `data/README.md`).
