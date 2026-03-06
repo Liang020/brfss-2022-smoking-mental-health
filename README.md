@@ -19,6 +19,11 @@ This was a group project. I led the **multivariable modeling and the subsequent 
 - Covariates: demographic + lifestyle factors
 - Models: multivariable regression with diagnostics and robustness checks
 
+## Key results (2–3 takeaways)
+- In univariate analysis, smoking status was associated with mentally unhealthy days: compared with never smokers, former smokers reported +0.72 days, daily smokers +3.13 days, and sometimes smokers +3.24 days (all p < 0.001).
+- After multivariable adjustment using a weighted log-linear model with HC3 robust standard errors, the smoking-status term remained significant overall (Type III p ≈ 0.0017). At the coefficient level, only former vs. never was significant (β = −0.384, p ≈ 0.0010), corresponding to about 32% fewer mentally unhealthy days on the original scale.
+- Diagnostics improved after log transformation, but heteroskedasticity persisted (motivating robust SE). VIF suggested no serious multicollinearity. The final model had weighted R² ≈ 0.166 (Adj-R² ≈ 0.160).
+
 ## Report
 - Live HTML report (GitHub Pages): (to be added)
 
