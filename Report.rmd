@@ -1,0 +1,954 @@
+---
+title: "Project"
+author: "Liang Hong lh4195, Linghan Li ll6040"
+date: "2025-10-29"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(haven)
+library(dplyr)
+library(car)
+library(gtsummary)
+library(ggplot2)
+library(lmtest)
+library(sandwich)
+```
+
+```{r}
+## ===== 1. 读原始 BRFSS 数据 =====
+dat_raw <- read_xpt("/Users/lianghong/Desktop/第一学期/2353 Linear Regression and Modeling/project/LLCP2022.XPT ")   # 注意不要有多余空格
+
+## ===== 2. 基础清洗：只处理“特殊码”并保留数值编码 =====
+dat <- dat_raw %>%
+  mutate(
+    ## 结局：MENTHLTH
+    MENTHLTH = case_when(
+      MENTHLTH == 88              ~ 0,          # 过去 30 天“0 天不健康”
+      MENTHLTH %in% c(77, 99)     ~ NA_real_,   # 不知道/拒答
+      TRUE                        ~ as.numeric(MENTHLTH)
+    ),
+
+    ## 连续协变量：睡眠时间
+    SLEPTIM1 = case_when(
+      SLEPTIM1 %in% c(77, 99)     ~ NA_real_,
+      TRUE                        ~ as.numeric(SLEPTIM1)
+    ),
+
+    ## 吸烟相关：保持 BRFSS 原始编码（1,2,3…），只把 7/9 置为 NA
+    SMOKDAY2 = ifelse(SMOKDAY2 %in% c(7, 9), NA_integer_, as.integer(SMOKDAY2)),
+    SMOKE100 = ifelse(SMOKE100 %in% c(7, 9), NA_integer_, as.integer(SMOKE100)),
+
+    ## 其他协变量：只把 7/9/77/99 这些“非数据”清掉
+    EXERANY2 = ifelse(EXERANY2 %in% c(7, 9),   NA_integer_, as.integer(EXERANY2)),
+    INCOME3  = ifelse(INCOME3  %in% c(77, 99), NA_integer_, as.integer(INCOME3)),
+    EDUCA    = ifelse(EDUCA    == 9,          NA_integer_, as.integer(EDUCA)),
+    MARITAL  = ifelse(MARITAL  %in% c(7, 9),   NA_integer_, as.integer(MARITAL)),
+    EMPLOY1  = ifelse(EMPLOY1  == 9,          NA_integer_, as.integer(EMPLOY1))
+  ) %>%
+  ## 只保留后面会在模型里用到的变量
+  select(
+    MENTHLTH, SLEPTIM1, EXERANY2, `_AGEG5YR`, SEXVAR,
+    INCOME3, EDUCA, MARITAL, EMPLOY1,
+    SMOKDAY2, SMOKE100, `_LLCPWT`
+  )
+
+## ===== 3. 构造四类 smoke_status（在数值编码基础上） =====
+## BRFSS 编码：
+##   SMOKE100: 1 = smoked ≥100 cigs; 2 = <100
+##   SMOKDAY2: 1 = 每天, 2 = 有时, 3 = 一点都不抽 (在当前吸烟者里)
+dat <- dat %>%
+  mutate(
+    smoke_status = case_when(
+      SMOKE100 == 2                        ~ "Never smoker",
+      SMOKE100 == 1 & SMOKDAY2 == 3        ~ "Former smoker",
+      SMOKE100 == 1 & SMOKDAY2 == 1        ~ "Daily smoker",
+      SMOKE100 == 1 & SMOKDAY2 == 2        ~ "Sometimes smoker",
+      TRUE                                 ~ NA_character_
+    )
+  )
+
+## ===== 4. 完整个案：所有建模变量必须非缺失 =====
+model_vars <- c(
+  "MENTHLTH","SLEPTIM1","EXERANY2","_AGEG5YR","SEXVAR",
+  "INCOME3","EDUCA","MARITAL","EMPLOY1",
+  "smoke_status","_LLCPWT"
+)
+
+dat_cc <- dat %>%
+  filter(if_all(all_of(model_vars), ~ !is.na(.)))
+
+## ===== 5. 抽 10,000 行作为分析样本 dat_small =====
+set.seed(2025)
+dat_small <- dat_cc %>%
+  sample_n(10000)
+
+## ===== 6. 在 dat_small 上做因子化 & 贴标签（方便表格 / 模型） =====
+dat_small <- dat_small %>%
+  mutate(
+    smoke_status = factor(
+      smoke_status,
+      levels = c("Never smoker","Former smoker",
+                 "Daily smoker","Sometimes smoker")
+    ),
+    EXERANY2 = factor(EXERANY2, levels = c(2, 1),
+                      labels = c("No","Yes")),
+    `_AGEG5YR` = factor(`_AGEG5YR`, levels = 1:14,
+                        labels = c("18–24","25–29","30–34","35–39","40–44","45–49",
+                                   "50–54","55–59","60–64","65–69","70–74","75–79","80–84","85+")),
+    SEXVAR   = factor(SEXVAR, levels = c(2, 1),
+                      labels = c("Female","Male")),
+    INCOME3  = factor(INCOME3, levels = 1:8,
+                      labels = c("<$10k","$10–<15k","$15–<20k","$20–<25k",
+                                 "$25–<35k","$35–<50k","$50–<75k","≥$75k")),
+    EDUCA    = factor(EDUCA, levels = 1:6,
+                      labels = c("No school/KG","Grades 1–8","Grades 9–11",
+                                 "HS/GED","Some college","College ≥4y")),
+    MARITAL  = factor(MARITAL, levels = 1:6,
+                      labels = c("Married","Divorced","Widowed","Separated",
+                                 "Never married","Unmarried couple")),
+    EMPLOY1  = factor(EMPLOY1, levels = 1:8,
+                      labels = c("Employed wages","Self-employed","Out ≥1y","Out <1y",
+                                 "Homemaker","Student","Retired","Unable to work"))
+  )
+
+## 检查一下四类吸烟人数，确认没问题：
+table(dat_small$smoke_status)
+```
+
+# Empirical Data Analysis
+
+## Table 1: Overall baseline characteristics
+
+```{r}
+vars_for_table1 <- c(
+  "MENTHLTH", #continue
+  "SLEPTIM1", #continue
+  "EXERANY2", #categorical
+  "_AGEG5YR", #categorical
+  "SEXVAR",   #categorical
+  "INCOME3",  #categorical
+  "EDUCA",    #categorical
+  "MARITAL",  #categorical
+  "EMPLOY1",  #categorical
+  "smoke_status"
+)
+
+tbl1 <- dat_small %>%
+  select(all_of(vars_for_table1)) %>%
+  tbl_summary(
+    type = list(
+      MENTHLTH   ~ "continuous",
+      SLEPTIM1   ~ "continuous"
+    ),
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      MENTHLTH   ~ "Number of mentally unhealthy days (past 30 days)",
+      SLEPTIM1   ~ "Sleep duration (hours per night)",
+      EXERANY2   ~ "Any exercise in past 30 days",
+      `_AGEG5YR` ~ "Age (5-year categories)",
+      SEXVAR     ~ "Sex",
+      INCOME3    ~ "Household income level",
+      EDUCA      ~ "Education level",
+      MARITAL    ~ "Marital status",
+      EMPLOY1    ~ "Employment status",
+      smoke_status   ~ "Smoking status"
+    ),
+    missing = "ifany"
+  )
+
+tbl1
+```
+
+## Smoking distribution (pie chart)
+
+```{r}
+dat_tab <- dat_small %>%
+  select(smoke_status)
+
+smok_tab <- table(dat_tab$smoke_status)
+
+pie(
+  smok_tab,
+  labels = paste0(
+    names(smok_tab), " (",
+    round(100 * smok_tab / sum(smok_tab), 1), "%)"
+  ),
+  main = "Smoke Distribution in the Sample"
+)
+```
+
+## Smoke and Gender
+```{r}
+dat_small %>%
+  filter(
+    !is.na(smoke_status),
+    smoke_status != "Unknown",
+    !is.na(SEXVAR)
+  ) %>%
+  mutate(
+    SEXVAR = factor(SEXVAR,
+                    levels = c(1, 2),
+                    labels = c("Male", "Female"))
+  ) %>%
+  ggplot(aes(x = smoke_status, fill = SEXVAR)) +
+  geom_bar(position = position_dodge(width = 0.8), alpha=0.7) +
+  labs(
+    title = "Smoking Status Distribution by Sex",
+    x = "Smoking Status",
+    y = "Count",
+    fill = "Sex"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal(base_size = 14)
+```
+
+## Age and Smoke
+```{r}
+dat_small %>%
+  filter(
+    !is.na(smoke_status),
+    smoke_status != "Unknown"
+  ) %>%
+  dplyr::group_by(`_AGEG5YR`, smoke_status) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    .groups = "drop_last"
+  ) %>%
+  dplyr::mutate(
+    total_age  = sum(n),
+    proportion = n / total_age
+  ) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x = `_AGEG5YR`,
+             y = proportion,
+             color = smoke_status,
+             group = smoke_status)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Smoking Trend Across Age Groups",
+    x = "Age Group (5-year categories)",
+    y = "Proportion of Participants",
+    color = "Smoking Status"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+## Distribution of key variables
+
+### MENTHLTH (Histogram)
+
+```{r}
+ggplot(dat_small, aes(x = MENTHLTH)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribution of Mentally Unhealthy Days",
+    x = "MENTHLTH (Days)",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+
+### Boxplot: MENTHLTH vs Smoking Category
+
+```{r}
+dat_plot <- dat_small %>%
+  filter(!is.na(smoke_status), smoke_status != "Unknown") %>%   # 去掉 NA 和 Unknown
+  mutate(
+    smoke_cat = factor(
+      smoke_status,
+      levels = c("Never smoker", "Former smoker",
+                 "Daily smoker", "Sometimes smoker")
+    )
+  )
+
+ggplot(dat_plot, aes(x = smoke_cat, y = MENTHLTH, fill = smoke_cat)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(
+    breaks = seq(0, 30, by = 2),
+    limits = c(0, 30)
+  ) +
+  labs(
+    title = "Mentally Unhealthy Days by Smoking Status",
+    x = "Smoking Status",
+    y = "MENTHLTH (Days)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+```
+### Density plot : MENTHLTH vs Smoking Category
+```{r}
+dat_plot %>%
+  ggplot(aes(x = MENTHLTH, color = smoke_status, fill = smoke_status)) +
+  geom_density(alpha = 0.25, adjust = 1.2) +
+  labs(
+    title = "Density: Mentally Unhealthy Days",
+    x = "MENTHLTH",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+### Density plot (log-transformed): MENTHLTH vs Smoking Category
+```{r}
+dat_plot %>%
+  ggplot(aes(x = log1p(MENTHLTH), color = smoke_status, fill = smoke_status)) +
+  geom_density(alpha = 0.25, adjust = 1.2) +
+  labs(
+    title = "Log-Scaled Density: Mentally Unhealthy Days",
+    x = "log(MENTHLTH + 1)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+# Confounder test
+
+## Sleep time
+```{r}
+kruskal.test(SLEPTIM1 ~ smoke_status, data = dat_small)
+
+fit_sleep <- lm(MENTHLTH ~ SLEPTIM1, data = dat_small)
+summary(fit_sleep)
+```
+
+## Exercise
+```{r}
+tab_exer_smoke <- table(dat_small$smoke_status, dat_small$EXERANY2)
+chisq.test(tab_exer_smoke)   
+
+fit_exer <- lm(MENTHLTH ~ EXERANY2, data = dat_small)
+summary(fit_exer)
+```
+
+## Age
+```{r}
+tab_age_smoke <- table(dat_small$smoke_status, dat_small$`_AGEG5YR`)
+chisq.test(tab_age_smoke)
+
+fit_age <- lm(MENTHLTH ~ `_AGEG5YR`, data = dat_small)
+summary(fit_age)
+```
+
+## Sex
+```{r}
+tab_sex_smoke <- table(dat_small$smoke_status, dat_small$SEXVAR)
+chisq.test(tab_sex_smoke)
+
+fit_sex <- lm(MENTHLTH ~ SEXVAR, data = dat_small)
+summary(fit_sex)
+```
+
+## Income
+```{r}
+tab_inc_smoke <- table(dat_small$smoke_status, dat_small$INCOME3)
+chisq.test(tab_inc_smoke)
+
+fit_inc <- lm(MENTHLTH ~ INCOME3, data = dat_small)
+summary(fit_inc)
+```
+
+## Education
+```{r}
+tab_edu_smoke <- table(dat_small$smoke_status, dat_small$EDUCA)
+chisq.test(tab_edu_smoke)
+
+fit_edu <- lm(MENTHLTH ~ EDUCA, data = dat_small)
+summary(fit_edu)
+```
+
+## Marital
+```{r}
+tab_mar_smoke <- table(dat_small$smoke_status, dat_small$MARITAL)
+chisq.test(tab_mar_smoke)
+
+fit_mar <- lm(MENTHLTH ~ MARITAL, data = dat_small)
+summary(fit_mar)
+```
+
+## Employ
+```{r}
+tab_emp_smoke <- table(dat_small$smoke_status, dat_small$EMPLOY1)
+chisq.test(tab_emp_smoke)
+
+fit_emp <- lm(MENTHLTH ~ EMPLOY1, data = dat_small)
+summary(fit_emp)
+```
+
+
+# Single predictor model: mental health vs smoking status
+
+```{r}
+dat_simple <- dat_small %>%
+  filter(!is.na(smoke_status), smoke_status != "Unknown") %>%
+  mutate(
+    smoke_status = factor(
+      smoke_status,
+      levels = c("Never smoker", "Former smoker",
+                 "Daily smoker", "Sometimes smoker")
+    )
+  )
+
+dat_simple <- dat_simple %>%
+  mutate(
+    smoke_status = relevel(smoke_status, ref = "Never smoker")
+  )                                                              #Never smoker is baseline group
+
+fit1 <- lm(MENTHLTH ~ smoke_status, data = dat_simple)
+summary(fit1)
+range(fitted(fit1))
+range(residuals(fit1))
+```
+
+## QQ plot
+```{r}
+res <- residuals(fit1)
+
+qqnorm(res,
+       main = "QQ Plot of Residuals for fit1",
+       pch = 19,      
+       cex = 0.6,       
+       col = "darkblue" 
+)
+
+qqline(res, col = "red", lwd = 2)
+```
+
+## BP test
+```{r}
+bptest(fit1)
+```
+
+
+
+# Multiple predictors model
+```{r}
+fit_w <- lm(MENTHLTH ~ smoke_status + `_AGEG5YR` + SEXVAR + INCOME3 +
+              EDUCA + EXERANY2 + SLEPTIM1 + MARITAL + EMPLOY1,
+            data = dat_small, weights = `_LLCPWT`)
+
+summary(fit_w)
+```
+
+
+```{r}
+## ========= 线性回归模型诊断（基于已拟合好的 fit_w） =========
+
+## 1) 四联图：同时检查线性关系、正态性、同方差性和影响点
+par(mfrow = c(2, 2))
+plot(fit_w)                  # Residuals vs Fitted / QQ / Scale-Location / Cook's distance
+par(mfrow = c(1, 1))         # 画完恢复布局
+
+## 2) 异方差检验：Breusch–Pagan test
+##    H0：残差方差为常数（同方差）；p < 0.05 说明存在异方差
+library(lmtest)
+bptest(fit_w)
+
+## 3) 稳健标准误（HC3）：只替换协方差矩阵，仍然是 lm 模型
+##    用于在存在异方差时，得到更稳健的标准误和显著性检验
+library(sandwich)
+coeftest(fit_w, vcov. = vcovHC(fit_w, type = "HC3"))
+
+## 4) 多重共线性：方差膨胀因子 VIF
+##    一般 VIF < 5（有的教材用 < 10）认为共线性问题不严重
+library(car)
+vif(fit_w)
+
+## 5) 杠杆值（leverage）检查：识别“在 X 空间里很边缘”的点
+hatv <- hatvalues(fit_w)
+head(hatv)                    # 先看前几行
+
+n <- nrow(model.frame(fit_w)) # 样本量（模型真正用到的观测数）
+p <- fit_w$rank               # 模型中估计的参数个数（含截距）
+lev_cut <- 2 * p / n          # 常用经验阈值：2p / n
+
+lev_cut                      # 打印阈值
+which(hatv > lev_cut)        # 高杠杆点所在的行号（integer(0) 代表无）
+summary(hatv)                # 杠杆值整体分布
+
+## 6) 异常点（outliers）：学生化残差（studentized residual）
+stud <- rstudent(fit_w)       # 每个观测的学生化残差
+stud[which.max(abs(stud))]    # 绝对值最大的那一个残差
+
+## Bonferroni 校正：计算临界值 qt(1 - alpha/(2n), df = n - p)
+alpha <- 0.05
+crit_stud <- qt(1 - alpha / (2 * n), df = n - p)
+crit_stud                     # 打印临界值
+
+## 所有被判定为异常点的观测行号（如果输出 integer(0)，说明没有）
+which(abs(stud) > crit_stud)
+
+## 7) 影响点（influential points）：Cook 距离
+cook <- cooks.distance(fit_w)
+
+## 常用经验阈值：F 分布的某个分位数，这里用 qf(0.5, p, n - p) 作为参考
+crit_cook <- qf(0.5, df1 = p, df2 = n - p)
+crit_cook                      # 打印 Cook 距离阈值
+
+## Cook 距离大于阈值的观测行号（如果输出 integer(0)，说明没有明显影响点）
+which(cook > crit_cook)
+```
+```{r}
+## 1) 以 sqrt(MENTHLTH + 0.5) 为新的结局变量
+dat_small <- dat_small %>%
+  mutate(MENTHLTH_sqrt = sqrt(MENTHLTH + 0.5))
+
+## 2) 拟合加权最小二乘（WLS）主模型：协变量同原来
+fit_w_sqrt <- lm(MENTHLTH_sqrt ~ smoke_status + `_AGEG5YR` + SEXVAR +
+                   INCOME3 + EDUCA + EXERANY2 + SLEPTIM1 +
+                   MARITAL + EMPLOY1,
+                 data = dat_small, weights = `_LLCPWT`)
+
+summary(fit_w_sqrt)
+
+## ===== 模型诊断 for fit_w_sqrt =====
+
+## 1) 四联图：线性、正态性、同方差、影响点
+par(mfrow = c(2, 2))
+plot(fit_w_sqrt)
+par(mfrow = c(1, 1))
+
+## 2) Breusch–Pagan 异方差检验
+library(lmtest)
+bptest(fit_w_sqrt)   # 希望 p 值变大一些，异方差缓解
+
+## 3) 稳健标准误（HC3）
+library(sandwich)
+coeftest(fit_w_sqrt, vcov. = vcovHC(fit_w_sqrt, type = "HC3"))
+
+## 4) 多重共线性：VIF
+library(car)
+vif(fit_w_sqrt)
+
+## 5) 杠杆值（leverage）检查
+hatv_s <- hatvalues(fit_w_sqrt)
+summary(hatv_s)
+
+n_s <- nrow(model.frame(fit_w_sqrt))   # 样本量
+p_s <- fit_w_sqrt$rank                 # 模型参数个数（含截距）
+lev_cut_s <- 2 * p_s / n_s             # 常用阈值 2p/n
+
+which(hatv_s > lev_cut_s)             # 高杠杆点行号（可能很多，只要不极端就写描述）
+
+## 6) 异常值（studentized residuals）
+stud_s <- rstudent(fit_w_sqrt)
+max(abs(stud_s))                       # 看一下最大绝对值
+
+# Bonferroni 临界值
+crit_bonf <- qt(1 - 0.05 / (2 * n_s), df = n_s - p_s)
+crit_bonf
+
+which(abs(stud_s) > crit_bonf)         # 一般为空：说明无显著异常值
+
+## 7) 影响点（Cook's distance）
+cook_s <- cooks.distance(fit_w_sqrt)
+summary(cook_s)
+
+# 常用经验阈值：4/n 或 F 分布阈值（你之前用的是 qf(0.5, p, n-p)）
+cook_cut <- 4 / n_s
+cook_cut
+
+which(cook_s > cook_cut)               # 少量点超出就描述为“少数可能影响点”
+```
+
+```{r}
+library(MASS)
+
+y <- dat_small$MENTHLTH + 0.1   # 确保为正
+fit0 <- lm(
+  y ~ smoke_status + `_AGEG5YR` + SEXVAR + INCOME3 + EDUCA +
+          EXERANY2 + SLEPTIM1 + MARITAL + EMPLOY1 ,
+  data = dat_small, weights = `_LLCPWT`
+)
+
+bc   <- boxcox(fit0, plotit = TRUE)
+lam  <- bc$x[which.max(bc$y)]
+```
+```{r}
+## ===== Box-Cox 版本（与其余模型同一右端式）=====
+library(MASS)
+library(lmtest)
+
+# (若还没建过) √ 版本的因变量
+if (!"MENTHLTH_sqrt" %in% names(dat_small)) {
+  dat_small$MENTHLTH_sqrt <- sqrt(dat_small$MENTHLTH + 0.5)
+}
+
+# 先对 y(+0.1) 做 MLE 选 λ（右端式与 fit_w 一致）
+y_pos <- dat_small$MENTHLTH + 0.1
+fit0_bc <- lm(
+  y_pos ~ smoke_status + `_AGEG5YR` + SEXVAR + INCOME3 + EDUCA +
+          EXERANY2 + SLEPTIM1 + MARITAL + EMPLOY1,
+  data = dat_small, weights = `_LLCPWT`
+)
+bc      <- boxcox(fit0_bc, plotit = TRUE)      # 需要图就留 TRUE
+lam_hat <- bc$x[which.max(bc$y)]               # 估计到的 λ
+
+# Box–Cox 变换
+bc_tr <- function(z, lam) if (abs(lam) < 1e-8) log(z) else (z^lam - 1)/lam
+dat_small$y_bc <- bc_tr(y_pos, lam_hat)
+```
+```{r}
+## ==== packages ====
+library(MASS)    # boxcox
+library(lmtest)  # bptest
+library(dplyr)
+library(tibble)
+
+## ==== 统一自变量（与你给的 fit_w / fit_sqrt / fit_log 一致）====
+rhs <- reformulate(c("smoke_status","`_AGEG5YR`","INCOME3","EDUCA",
+                     "EXERANY2","SLEPTIM1","MARITAL"))
+
+## ---- 小工具：权重RMSE（原尺度）+ 反变换 ----
+wrmse <- function(err, w) sqrt(sum(w * err^2) / sum(w))
+inv_pred <- function(eta, type, lam = NULL) {
+  switch(type,
+         orig   = eta,
+         sqrt   = pmax(eta^2 - 0.5, 0),
+         log    = pmax(exp(eta) - 0.1, 0),
+         boxcox = pmax((lam * eta + 1)^(1/lam) - 0.1, 0))
+}
+
+## ==== 估计 Box-Cox 的 λ（对 y+0.1，右端式与上面一致）====
+tmp <- dat_small
+tmp$y_pos <- dat_small$MENTHLTH + 0.1
+bc_fit <- lm(update(rhs, y_pos ~ .), data = tmp, weights = tmp[["_LLCPWT"]])
+bc     <- boxcox(bc_fit, plotit = FALSE)
+lam_hat <- bc$x[which.max(bc$y)]   # 一般接近 -0.18
+
+## ==== 拟合四个模型（各自在其变换尺度上）====
+fit_w    <- lm(update(rhs, MENTHLTH ~ .), data = dat_small, weights = dat_small[["_LLCPWT"]])
+fit_sqrt <- lm(update(rhs, sqrt(MENTHLTH + 0.5) ~ .), data = dat_small, weights = dat_small[["_LLCPWT"]])
+fit_log  <- lm(update(rhs, log(MENTHLTH + 0.1) ~ .),  data = dat_small, weights = dat_small[["_LLCPWT"]])
+fit_bc   <- lm(update(rhs, ((MENTHLTH + 0.1)^lam_hat - 1)/lam_hat ~ .),
+               data = dat_small, weights = dat_small[["_LLCPWT"]])
+
+## ==== 原始尺度的加权训练 RMSE ====
+w <- dat_small[["_LLCPWT"]]
+y <- dat_small$MENTHLTH
+
+rmse_w    <- wrmse(predict(fit_w)                         - y, w)
+rmse_sqrt <- wrmse(inv_pred(predict(fit_sqrt), "sqrt")    - y, w)
+rmse_log  <- wrmse(inv_pred(predict(fit_log),  "log")     - y, w)
+rmse_bc   <- wrmse(inv_pred(predict(fit_bc),   "boxcox", lam_hat) - y, w)
+
+## ==== 汇总表（仅 AIC、BP p、RMSE）====
+tab <- tibble(
+  Model = c("Original", "Sqrt(+0.5)", "Log(+0.1)", sprintf("BoxCox(+0.1, λ=%.3f)", lam_hat)),
+  AIC   = c(AIC(fit_w), AIC(fit_sqrt), AIC(fit_log), AIC(fit_bc)),
+  `BP_p`= c(bptest(fit_w)$p.value, bptest(fit_sqrt)$p.value,
+            bptest(fit_log)$p.value, bptest(fit_bc)$p.value),
+  RMSE_w = c(rmse_w, rmse_sqrt, rmse_log, rmse_bc)  # 原始尺度、加权
+)
+
+tab %>% arrange(RMSE_w)
+```
+
+
+```{r}
+fit_log <- lm(
+  log(MENTHLTH + 0.1) ~ smoke_status + `_AGEG5YR` + SEXVAR + INCOME3 +
+    EDUCA + EXERANY2 + SLEPTIM1 + MARITAL + EMPLOY1 ,
+  data = dat_small,
+  weights = `_LLCPWT`
+)
+
+summary(fit_log)
+
+## 1) 四联图：线性、正态性、同方差、影响点
+par(mfrow = c(2, 2))
+plot(fit_log)
+par(mfrow = c(1, 1))
+
+## 2) Breusch–Pagan 异方差检验
+library(lmtest)
+bptest(fit_log)   # 希望 p 值变大一些，异方差缓解
+
+## 3) 稳健标准误（HC3）
+library(sandwich)
+coeftest(fit_log, vcov. = vcovHC(fit_log, type = "HC3"))
+
+## 4) 多重共线性：VIF
+library(car)
+vif(fit_log)
+
+## 5) 杠杆值（leverage）检查
+hatv_s <- hatvalues(fit_log)
+summary(hatv_s)
+
+n_s <- nrow(model.frame(fit_log))   # 样本量
+p_s <- fit_log$rank                 # 模型参数个数（含截距）
+lev_cut_s <- 2 * p_s / n_s             # 常用阈值 2p/n
+
+which(hatv_s > lev_cut_s)             # 高杠杆点行号（可能很多，只要不极端就写描述）
+
+## 6) 异常值（studentized residuals）
+stud_s <- rstudent(fit_log)
+max(abs(stud_s))                       # 看一下最大绝对值
+
+# Bonferroni 临界值
+crit_bonf <- qt(1 - 0.05 / (2 * n_s), df = n_s - p_s)
+crit_bonf
+
+which(abs(stud_s) > crit_bonf)         # 一般为空：说明无显著异常值
+
+## 7) 影响点（Cook's distance）
+cook_s <- cooks.distance(fit_log)
+summary(cook_s)
+
+# 常用经验阈值：4/n 或 F 分布阈值（你之前用的是 qf(0.5, p, n-p)）
+cook_cut <- 4 / n_s
+cook_cut
+
+which(cook_s > cook_cut)               # 少量点超出就描述为“少数可能影响点”
+```
+
+```{r}
+fit_log2 <- lm(
+  log(MENTHLTH + 0.1) ~ smoke_status + `_AGEG5YR` + SEXVAR + INCOME3 +
+    EDUCA + EXERANY2 + SLEPTIM1 + MARITAL + EMPLOY1 + I(SLEPTIM1^2) + EXERANY2:smoke_status ,
+  data = dat_small,
+  weights = `_LLCPWT`
+)
+
+summary(fit_log2)
+
+## 1) 四联图：线性、正态性、同方差、影响点
+par(mfrow = c(2, 2))
+plot(fit_log2)
+par(mfrow = c(1, 1))
+
+## 2) Breusch–Pagan 异方差检验
+library(lmtest)
+bptest(fit_log2)   # 希望 p 值变大一些，异方差缓解
+
+## 3) 稳健标准误（HC3）
+library(sandwich)
+coeftest(fit_log2, vcov. = vcovHC(fit_log2, type = "HC3"))
+
+## 4) 多重共线性：VIF
+library(car)
+vif(fit_log2, type = "predictor")
+
+## 5) 杠杆值（leverage）检查
+hatv_s <- hatvalues(fit_log2)
+summary(hatv_s)
+
+n_s <- nrow(model.frame(fit_log2))   # 样本量
+p_s <- fit_log2$rank                 # 模型参数个数（含截距）
+lev_cut_s <- 2 * p_s / n_s             # 常用阈值 2p/n
+
+which(hatv_s > lev_cut_s)             # 高杠杆点行号（可能很多，只要不极端就写描述）
+
+## 6) 异常值（studentized residuals）
+stud_s <- rstudent(fit_log2)
+max(abs(stud_s))                       # 看一下最大绝对值
+
+# Bonferroni 临界值
+crit_bonf <- qt(1 - 0.05 / (2 * n_s), df = n_s - p_s)
+crit_bonf
+
+which(abs(stud_s) > crit_bonf)         # 一般为空：说明无显著异常值
+
+## 7) 影响点（influential points）：Cook 距离
+cook <- cooks.distance(fit_log2)
+
+## 常用经验阈值：F 分布的某个分位数，这里用 qf(0.5, p, n - p) 作为参考
+crit_cook <- qf(0.5, df1 = p, df2 = n - p)
+crit_cook                      # 打印 Cook 距离阈值
+
+## Cook 距离大于阈值的观测行号（如果输出 integer(0)，说明没有明显影响点）
+which(cook > crit_cook)
+```
+```{r}
+## ========= helpers：加权指标 + 安全封装 =========
+rmse_w <- function(y, yhat, w) sqrt(sum(w * (y - yhat)^2) / sum(w))
+mae_w  <- function(y, yhat, w) sum(w * abs(y - yhat)) / sum(w)
+r2_w   <- function(y, yhat, w) {
+  num <- sum(w * (y - yhat)^2)
+  den <- sum(w * (y - weighted.mean(y, w))^2)
+  1 - num / den
+}
+safe_metrics <- function(y, yhat, w){
+  ok <- is.finite(y) & is.finite(yhat) & is.finite(w) & (w > 0)
+  tibble::tibble(
+    RMSE_w = rmse_w(y[ok], yhat[ok], w[ok]),
+    MAE_w  = mae_w (y[ok], yhat[ok], w[ok]),
+    R2_w   = r2_w  (y[ok], yhat[ok], w[ok])
+  )
+}
+
+## ========= 公式（与你当前模型一致）=========
+rhs <- MENTHLTH ~ smoke_status + `_AGEG5YR` + SEXVAR + INCOME3 +
+                  EDUCA + EXERANY2 + SLEPTIM1 + MARITAL + EMPLOY1
+
+## ========= 划分 8k / 2k =========
+set.seed(2025)
+id_te <- sample(seq_len(nrow(dat_small)), 2000)
+te <- dat_small[id_te, ]
+tr <- dat_small[-id_te, ]
+
+w_tr <- tr$`_LLCPWT`; w_te <- te$`_LLCPWT`
+y_te <- te$MENTHLTH
+
+## ========= 1) 原尺度 WLS =========
+fit_w_tr <- lm(rhs, data = tr, weights = `_LLCPWT`)
+pred_w   <- predict(fit_w_tr, newdata = te)  # 已是“天数”
+
+## ========= 2) √ 变换 + smearing 回原尺度 =========
+fit_sqrt_tr <- lm(update(rhs, sqrt(MENTHLTH + 0.5) ~ .),
+                  data = tr, weights = `_LLCPWT`)
+z_hat_te <- predict(fit_sqrt_tr, newdata = te)          # z = sqrt(y+0.5)
+res_sqrt <- residuals(fit_sqrt_tr)                      # 在 √ 尺度的残差
+# 加权 smearing 回变换：E[(mu+eps)^2 - 0.5]
+pred_sqrt <- vapply(
+  z_hat_te,
+  function(mu) sum(w_tr * ((mu + res_sqrt)^2 - 0.5)) / sum(w_tr),
+  numeric(1)
+)
+
+## ========= 3) log 变换 + smearing 回原尺度 =========
+fit_log_tr <- lm(update(rhs, log(MENTHLTH + 0.1) ~ .),
+                 data = tr, weights = `_LLCPWT`)
+eta_hat_te <- predict(fit_log_tr, newdata = te)         # eta = log(y+0.1)
+res_log    <- residuals(fit_log_tr)
+SF_log     <- sum(w_tr * exp(res_log)) / sum(w_tr)      # 加权 smearing 因子
+pred_log   <- exp(eta_hat_te) * SF_log - 0.1            # 回到“天数”
+
+## ========= 只展示：原模型 / √(smearing) / log(smearing) =========
+library(tibble)
+cmp <- tibble::tibble(
+  Model  = c("Original WLS", "Sqrt (+0.5)", "Log (+0.1)")
+) |>
+  dplyr::bind_cols(dplyr::bind_rows(
+    safe_metrics(y_te, pred_w,   w_te),
+    safe_metrics(y_te, pred_sqrt, w_te),
+    safe_metrics(y_te, pred_log,  w_te)
+  ))
+
+cmp
+```
+
+```{r}
+# === 需要的包 ===
+library(dplyr)
+library(stringr)
+library(broom)
+library(sandwich)
+library(lmtest)
+library(car)        # Anova 的 white.adjust 支持稳健检验
+library(tibble)
+
+# 假设已经有最终模型：fit_log2
+# fit_log2 <- lm(log(MENTHLTH + 0.1) ~ smoke_status + `_AGEG5YR` + INCOME3 +
+#                  EDUCA + EXERANY2 + SLEPTIM1 + MARITAL +
+#                  I(SLEPTIM1^2) + EXERANY2:smoke_status,
+#                data = dat_small, weights = `_LLCPWT`)
+
+
+# 推荐：Type III 用和为零对比
+options(contrasts = c("contr.sum","contr.poly"))
+
+anova_overall <- car::Anova(fit_log2, type = 3, white.adjust = "hc3")
+df_overall <- as.data.frame(anova_overall) |> tibble::rownames_to_column("Term")
+
+# 自动抓取列名（F/Chisq、df、p列在不同模型下名字不同）
+pcol    <- intersect(c("Pr(>F)", "Pr(>Chisq)", "Pr(>Wald)", "Pr(>LR)"), names(df_overall))[1]
+statcol <- intersect(c("F value", "F", "Chisq", "Wald"),                        names(df_overall))[1]
+dfcol   <- intersect(c("Df", "num Df"),                                        names(df_overall))[1]
+
+tbl_all <- df_overall |>
+  dplyr::mutate(
+    Statistic = .data[[statcol]],
+    df1       = .data[[dfcol]],
+    p.value   = .data[[pcol]],
+    Sig = dplyr::case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE            ~ ""
+    ),
+    is_inter = grepl(":", Term)
+  ) |>
+  dplyr::select(Term, df1, Statistic, p.value, Sig, is_inter) |>
+  dplyr::arrange(p.value)
+
+# 只保留显著（包括交互项）
+tbl_sig <- tbl_all |> dplyr::filter(p.value < 0.05)
+
+# 如果你想“只看显著的交互项”
+tbl_inter_sig <- tbl_all |> dplyr::filter(is_inter, p.value < 0.05)
+
+# 如果你想“主效应 + 显著交互项”，可以直接用 tbl_sig
+tbl_sig
+```
+
+
+```{r}
+## === Annotated Residuals vs Leverage ===
+## 依赖 fit_log2 已经拟合完毕（与你现在的最终模型一致）
+
+p <- length(coef(fit_log2))           # 参数个数
+n <- nobs(fit_log2)                   # 有效样本量
+h <- hatvalues(fit_log2)              # 杠杆值 (leverage, hat)
+r <- rstudent(fit_log2)               # 学生化残差
+D <- cooks.distance(fit_log2)         # Cook's distance
+
+h_cut <- 2 * p / n                    # 常用高杠杆阈值
+
+op <- par(mar = c(4.2, 4.2, 1.2, 1.2))
+plot(h, r,
+     xlab = "Leverage (hat values)",
+     ylab = "Studentized residuals",
+     pch = 21,
+     bg  = ifelse(D > 0.5 | h > h_cut, "tomato", "grey80"),
+     col = ifelse(D > 0.5 | h > h_cut, "tomato4", "grey60"),
+     cex = ifelse(D > 1, 1.2, 0.8))
+abline(h = 0, col = "grey70")
+
+## 高杠杆竖线：h = 2p/n
+abline(v = h_cut, lty = 2, lwd = 1.4, col = "steelblue3")
+text(h_cut, par("usr")[4], labels = expression(h==2*p/n),
+     pos = 3, cex = .9, col = "steelblue3", xpd = NA)
+
+## Cook's D 等值线（0.5 与 1）
+cook.levels <- c(0.5, 1)
+hh <- seq(max(min(h), 1e-4), max(h), length.out = 300)
+for (d in cook.levels) {
+  rr <- sqrt(d * p * (1 - hh) / hh)
+  lines(hh,  rr, lty = 2, col = "grey55")
+  lines(hh, -rr, lty = 2, col = "grey55")
+  ## 右侧贴标
+  xlabpos <- hh[which.max(hh)]
+  ylabpos <- sqrt(d * p * (1 - xlabpos) / xlabpos)
+  text(xlabpos,  ylabpos,  paste0("Cook's D = ", d),
+       pos = 2, cex = .85, col = "grey40")
+  text(xlabpos, -ylabpos, paste0("Cook's D = ", d),
+       pos = 2, cex = .85, col = "grey40")
+}
+
+## 图例：高杠杆 / 可能影响点
+legend("topleft",
+       legend = c("High leverage (h > 2p/n)", "Likely influential (Cook's D > 0.5)"),
+       pch = 21, pt.bg = c("white", "tomato"), pt.cex = c(1,1),
+       col = c("steelblue3", "tomato4"), bty = "n", cex = .85)
+
+par(op)
